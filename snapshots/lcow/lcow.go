@@ -183,7 +183,11 @@ func (s *snapshotter) Mounts(ctx context.Context, key string) ([]mount.Mount, er
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to get snapshot mount")
 	}
-	return s.mounts(snapshot), nil
+	_, info, _, err := storage.GetInfo(ctx, key)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to get snapshot info")
+	}
+	return s.mounts(ctx, snapshot, info)
 }
 
 func (s *snapshotter) Commit(ctx context.Context, name, key string, opts ...snapshots.Opt) error {
@@ -218,13 +222,18 @@ func (s *snapshotter) Remove(ctx context.Context, key string) error {
 	}
 	defer t.Rollback()
 
+	_, info, _, err := storage.GetInfo(ctx, key)
+	if err != nil {
+		return err
+	}
+
 	id, _, err := storage.Remove(ctx, key)
 	if err != nil {
 		return errors.Wrap(err, "failed to remove")
 	}
 
-	path := s.getSnapshotDir(id)
-	renamed := s.getSnapshotDir("rm-" + id)
+	path := s.getSnapshotDir(info, id)
+	renamed := s.getSnapshotDir(info, "rm-"+id)
 	if err := os.Rename(path, renamed); err != nil && !os.IsNotExist(err) {
 		return err
 	}
@@ -262,25 +271,30 @@ func (s *snapshotter) Close() error {
 	return s.ms.Close()
 }
 
-func (s *snapshotter) mounts(sn storage.Snapshot) []mount.Mount {
-	var (
-		roFlag           string
-		source           string
-		parentLayerPaths []string
-	)
-
+func (s *snapshotter) mounts(ctx context.Context, sn storage.Snapshot, info snapshots.Info) ([]mount.Mount, error) {
+	var roFlag string
 	if sn.Kind == snapshots.KindView {
 		roFlag = "ro"
 	} else {
 		roFlag = "rw"
 	}
 
+	var (
+		id        string
+		parentIDs []string
+	)
 	if len(sn.ParentIDs) == 0 || sn.Kind == snapshots.KindActive {
-		source = s.getSnapshotDir(sn.ID)
-		parentLayerPaths = s.parentIDsToParentPaths(sn.ParentIDs)
+		id = sn.ID
+		parentIDs = sn.ParentIDs
 	} else {
-		source = s.getSnapshotDir(sn.ParentIDs[0])
-		parentLayerPaths = s.parentIDsToParentPaths(sn.ParentIDs[1:])
+		id = sn.ParentIDs[0]
+		parentIDs = sn.ParentIDs[1:]
+	}
+
+	source := s.getSnapshotDir(info, id)
+	parentLayerPaths, err := s.parentIDsToParentPaths(ctx, parentIDs)
+	if err != nil {
+		return nil, err
 	}
 
 	// error is not checked here, as a string array will never fail to Marshal
@@ -297,10 +311,13 @@ func (s *snapshotter) mounts(sn storage.Snapshot) []mount.Mount {
 		},
 	})
 
-	return mounts
+	return mounts, nil
 }
 
-func (s *snapshotter) getSnapshotDir(id string) string {
+func (s *snapshotter) getSnapshotDir(info snapshots.Info, id string) string {
+	if loc, ok := info.Labels[rootfsLocLabel]; ok {
+		return filepath.Join(loc, id)
+	}
 	return filepath.Join(s.root, "snapshots", id)
 }
 
@@ -316,17 +333,24 @@ func (s *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 		return nil, errors.Wrap(err, "failed to create snapshot")
 	}
 
+	var snapshotInfo snapshots.Info
+	for _, o := range opts {
+		o(&snapshotInfo)
+	}
+
 	if kind == snapshots.KindActive {
 		log.G(ctx).Debug("createSnapshot active")
-		// Create the new snapshot dir
-		snDir := s.getSnapshotDir(newSnapshot.ID)
-		if err := os.MkdirAll(snDir, 0700); err != nil {
-			return nil, err
+
+		if loc, ok := snapshotInfo.Labels[rootfsLocLabel]; ok {
+			if s, err := os.Stat(loc); err != nil || !s.IsDir() {
+				return nil, errors.Wrapf(err, "invalid %q override: %q, bust be an existing directory", rootfsLocLabel, loc)
+			}
 		}
 
-		var snapshotInfo snapshots.Info
-		for _, o := range opts {
-			o(&snapshotInfo)
+		// Create the new snapshot dir
+		snDir := s.getSnapshotDir(snapshotInfo, newSnapshot.ID)
+		if err := os.MkdirAll(snDir, 0700); err != nil {
+			return nil, err
 		}
 
 		var sizeGB int
@@ -335,10 +359,7 @@ func (s *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 			sizeGB = int(i64)
 		}
 
-		var scratchLocation string
-		scratchLocation, _ = snapshotInfo.Labels[rootfsLocLabel]
-
-		scratchSource, err := s.openOrCreateScratch(ctx, sizeGB, scratchLocation)
+		scratchSource, err := s.openOrCreateScratch(ctx, sizeGB)
 		if err != nil {
 			return nil, err
 		}
@@ -362,14 +383,19 @@ func (s *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 		}
 	}
 
+	mounts, err := s.mounts(ctx, newSnapshot, snapshotInfo)
+	if err != nil {
+		return nil, err
+	}
+
 	if err := t.Commit(); err != nil {
 		return nil, errors.Wrap(err, "commit failed")
 	}
 
-	return s.mounts(newSnapshot), nil
+	return mounts, nil
 }
 
-func (s *snapshotter) openOrCreateScratch(ctx context.Context, sizeGB int, scratchLoc string) (_ *os.File, err error) {
+func (s *snapshotter) openOrCreateScratch(ctx context.Context, sizeGB int) (_ *os.File, err error) {
 	// Create the scratch.vhdx cache file if it doesn't already exit.
 	s.scratchLock.Lock()
 	defer s.scratchLock.Unlock()
@@ -380,10 +406,6 @@ func (s *snapshotter) openOrCreateScratch(ctx context.Context, sizeGB int, scrat
 	}
 
 	scratchFinalPath := filepath.Join(s.root, vhdFileName)
-	if scratchLoc != "" {
-		scratchFinalPath = filepath.Join(scratchLoc, vhdFileName)
-	}
-
 	scratchSource, err := os.OpenFile(scratchFinalPath, os.O_RDONLY, 0700)
 	if err != nil {
 		if !os.IsNotExist(err) {
@@ -430,10 +452,14 @@ func (s *snapshotter) openOrCreateScratch(ctx context.Context, sizeGB int, scrat
 	return scratchSource, nil
 }
 
-func (s *snapshotter) parentIDsToParentPaths(parentIDs []string) []string {
+func (s *snapshotter) parentIDsToParentPaths(ctx context.Context, parentIDs []string) ([]string, error) {
 	var parentLayerPaths []string
-	for _, ID := range parentIDs {
-		parentLayerPaths = append(parentLayerPaths, s.getSnapshotDir(ID))
+	for _, id := range parentIDs {
+		_, info, _, err := storage.GetInfo(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		parentLayerPaths = append(parentLayerPaths, s.getSnapshotDir(info, id))
 	}
-	return parentLayerPaths
+	return parentLayerPaths, nil
 }
